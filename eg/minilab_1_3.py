@@ -10,6 +10,7 @@ values or a dedicated GPU.
 from __future__ import annotations
 
 import json
+import http.client
 import math
 import os
 import queue
@@ -137,7 +138,8 @@ def _parse_command_local(text: str) -> Dict[str, Any]:
                 seconds = float(_extract_number(clause) or seconds)
             actions.append({
                 "type": "move",
-                "vx": 0.8,
+                # Match play.py's built-in W key exactly.
+                "vx": 1.0,
                 "vy": 0.0,
                 "wz": 0.0,
                 "duration": max(0.5, seconds),
@@ -188,7 +190,20 @@ def _validate_structured_command(result: Any, raw: str) -> Dict[str, Any]:
             "move", "turn", "goto_object", "stop", "chat"
         }:
             raise ValueError("structured response contains an invalid action")
-        actions.append(dict(action))
+        normalized = dict(action)
+        if normalized["type"] == "move":
+            normalized.setdefault("vx", 1.0)
+            normalized.setdefault("vy", 0.0)
+            normalized.setdefault("wz", 0.0)
+            duration = normalized.get("duration")
+            if not isinstance(duration, (int, float)) or duration <= 0:
+                normalized["duration"] = max(0.5, _extract_number(raw) or 3.0)
+        elif normalized["type"] == "turn":
+            if not isinstance(normalized.get("angle_deg"), (int, float)) or normalized["angle_deg"] == 0:
+                normalized["angle_deg"] = _extract_number(raw) or 90.0
+            if "direction" not in normalized:
+                normalized["direction"] = "right" if "right" in raw.lower() else "left"
+        actions.append(normalized)
     if not actions:
         return {"accepted": False, "reason": "unsupported or ambiguous request", "actions": []}
     return {
@@ -236,6 +251,7 @@ class StructuredCommandParser:
             "gemini 2.5 flash": "gemini-2.5-flash",
             "gemini 2.5 flash-latest": "gemini-2.5-flash",
             "gemini 3 flash preview": "gemini-3-flash-preview",
+            "gemini 3.5 flash lite": "gemini-3.5-flash-lite",
         }
         cleaned = model.strip().removeprefix("models/")
         if ":generateContent" in cleaned:
@@ -265,7 +281,8 @@ class StructuredCommandParser:
             parsed["provider"] = self.provider
             parsed["llm_used"] = True
             return parsed
-        except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError) as exc:
+        except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError,
+            http.client.HTTPException) as exc:
             fallback = _parse_command_local(raw)
             fallback["provider"] = self.provider
             fallback["llm_used"] = False

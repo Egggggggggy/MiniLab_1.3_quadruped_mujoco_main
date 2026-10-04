@@ -9,6 +9,7 @@ from eg.minilab_1_3 import (
     CommandExecutionWorker,
     MotionSkillController,
     StructuredCommandParser,
+    _validate_structured_command,
     evaluate_parser,
     load_object_config,
     parse_command,
@@ -35,6 +36,14 @@ def test_parse_command_preserves_turn_direction_angle_and_order():
     assert right_last["actions"][0]["direction"] == "right"
     assert left_last["actions"][0]["direction"] == "left"
     assert [item["type"] for item in ordered["actions"]] == ["turn", "move"]
+
+
+def test_incomplete_llm_motion_gets_wasd_defaults():
+    result = _validate_structured_command({"actions": [{"type": "move"}]}, "go forward")
+    action = result["actions"][0]
+    assert action["vx"] == 1.0
+    assert action["vy"] == 0.0
+    assert action["duration"] == 3.0
 
 
 def test_parse_command_rejects_non_english_or_empty():
