@@ -21,6 +21,7 @@ import yaml
 try:
     from minilab_1_3 import (
         MotionSkillController,
+        SpeechInputWorker,
         StructuredCommandParser,
         TerminalChatSession,
     )
@@ -29,6 +30,7 @@ except ModuleNotFoundError as exc:
         raise
     from eg.minilab_1_3 import (
         MotionSkillController,
+        SpeechInputWorker,
         StructuredCommandParser,
         TerminalChatSession,
     )
@@ -490,6 +492,11 @@ if __name__ == "__main__":
         help="start the threaded terminal command chat alongside MuJoCo",
     )
     parser.add_argument(
+        "--speech",
+        action="store_true",
+        help="enable microphone speech-to-text input; implies --chat",
+    )
+    parser.add_argument(
         "--chat-provider",
         default="local",
         choices=["local", "openai", "openai-compatible", "anthropic", "gemini"],
@@ -507,6 +514,8 @@ if __name__ == "__main__":
         parser.error("--gui and --headless cannot be used together")
     if args.duration is not None and args.duration <= 0:
         parser.error("--duration must be greater than 0")
+    if args.speech:
+        args.chat = True
 
     config_path = DEFAULT_CONFIG
     policy_path = (
@@ -637,6 +646,7 @@ if __name__ == "__main__":
     )
     chat_skills = SimulationMotionSkills(mj_model, mj_data)
     chat_session = None
+    speech_worker = None
     simulation_log = None
     if args.chat:
         simulation_log = args.simulation_log.expanduser().resolve().open("w", encoding="utf-8")
@@ -651,6 +661,9 @@ if __name__ == "__main__":
         chat_parser = StructuredCommandParser(args.chat_provider, model=args.chat_model)
         chat_session = TerminalChatSession(chat_parser, chat_skills)
         chat_session.start()
+        if args.speech:
+            speech_worker = SpeechInputWorker(chat_session)
+            speech_worker.start()
     with display as viewer:
         # The browser and the native viewer are mutually exclusive display
         # modes, to avoid rendering twice and slowing the simulation down.
@@ -812,6 +825,8 @@ if __name__ == "__main__":
                 time.sleep(simulation_dt - elapsed)
 
     if chat_session is not None:
+        if speech_worker is not None:
+            speech_worker.close()
         chat_session.close()
     if simulation_log is not None:
         simulation_log.close()

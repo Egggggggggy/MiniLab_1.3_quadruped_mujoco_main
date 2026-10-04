@@ -877,6 +877,33 @@ class TerminalChatSession:
         self.parser_worker.close()
         self.execution_worker.close()
 
+    def submit_text(self, text: str) -> None:
+        """Submit typed or transcribed text through the same Task 3 pipeline."""
+        text = (text or "").strip()
+        if not text:
+            self.output("[CMD] rejected reason=empty or non-English command")
+            return
+        if text.lower() in {"quit", "exit"}:
+            self._stop.set()
+            return
+        result = self.parser_worker.submit(text)
+        if result.get("llm_used"):
+            self.output("[LLM] provider=%s" % result.get("provider", self.parser_worker.parser.provider))
+        else:
+            self.output("[FALLBACK] provider=%s reason=%s" % (
+                result.get("provider", self.parser_worker.parser.provider),
+                result.get("fallback_reason", "local parser"),
+            ))
+        if not result["accepted"]:
+            self.output("[CMD] rejected reason=%s" % result["reason"])
+            return
+        self.output("[CMD] accepted actions=%s" % result["summary"])
+        execution = self.execution_worker.submit(result["actions"])
+        if not execution["accepted"]:
+            self.output("[CMD] execution_failed completed=%d/%d reason=%s" % (
+                execution["completed"], execution["total"], execution["reason"]
+            ))
+
     def _run(self) -> None:
         try:
             while not self._stop.is_set():
@@ -884,30 +911,65 @@ class TerminalChatSession:
                     text = input("you> ").strip()
                 except EOFError:
                     return
-                if text.lower() in {"quit", "exit"}:
-                    return
-                if not text:
-                    self.output("[CMD] rejected reason=empty or non-English command")
-                    continue
-                result = self.parser_worker.submit(text)
-                if result.get("llm_used"):
-                    self.output("[LLM] provider=%s" % result.get("provider", self.parser_worker.parser.provider))
-                else:
-                    self.output("[FALLBACK] provider=%s reason=%s" % (
-                        result.get("provider", self.parser_worker.parser.provider),
-                        result.get("fallback_reason", "local parser"),
-                    ))
-                if not result["accepted"]:
-                    self.output("[CMD] rejected reason=%s" % result["reason"])
-                    continue
-                self.output("[CMD] accepted actions=%s" % result["summary"])
-                execution = self.execution_worker.submit(result["actions"])
-                if not execution["accepted"]:
-                    self.output("[CMD] execution_failed completed=%d/%d reason=%s" % (
-                        execution["completed"], execution["total"], execution["reason"]
-                    ))
+                self.submit_text(text)
         finally:
             self._stop.set()
+
+
+class SpeechInputWorker:
+    """Capture microphone speech and pass English transcripts to Task 3."""
+
+    def __init__(self, session: TerminalChatSession, output=print, language: str = "en-US"):
+        self.session = session
+        self.output = output
+        self.language = language
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="minilab-speech-input", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        try:
+            import speech_recognition as sr
+        except ImportError:
+            self.output("[STT] unavailable: install with python -m pip install -e .[speech]")
+            return
+        recognizer = sr.Recognizer()
+        try:
+            microphone_names = sr.Microphone.list_microphone_names()
+            preferred_index = next((index for index, name in enumerate(microphone_names)
+                                    if "microphone array" in name.lower()
+                                    and "steam" not in name.lower()), None)
+            microphone = sr.Microphone(device_index=preferred_index)
+            selected_name = (microphone_names[preferred_index]
+                             if preferred_index is not None else "Windows default input")
+            with microphone:
+                self.output("[STT] microphone=%s" % selected_name)
+                self.output("[STT] microphone ready; speak an English command")
+                recognizer.adjust_for_ambient_noise(microphone, duration=1)
+                while not self._stop.is_set() and not self.session.stopped():
+                    try:
+                        audio = recognizer.listen(microphone, timeout=1, phrase_time_limit=8)
+                    except sr.WaitTimeoutError:
+                        continue
+                    try:
+                        transcript = recognizer.recognize_google(audio, language=self.language).strip()
+                    except sr.UnknownValueError:
+                        self.output("[STT] could not understand speech")
+                        continue
+                    except sr.RequestError as exc:
+                        self.output("[STT] service error: %s" % exc)
+                        continue
+                    if transcript:
+                        self.output("[STT] heard=%s" % transcript)
+                        self.session.submit_text(transcript)
+        except (OSError, AttributeError) as exc:
+            self.output("[STT] microphone unavailable: %s" % exc)
 
 
 def interactive_chat_loop(parser: Optional[StructuredCommandParser] = None) -> None:

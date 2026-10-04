@@ -8,6 +8,12 @@ python -m pip install -e .[test]
 python -m pytest -q
 ```
 
+For microphone speech input, install the optional speech extra:
+
+```powershell
+python -m pip install -e ".[test,speech]"
+```
+
 ## 2. Task 2: platurn right 45 degrees
 turn left 45 degrees
 tform and motion skills
@@ -18,6 +24,9 @@ python eg/play.py
 
 # native viewer plus threaded terminal chat
 python eg/play.py --chat --chat-provider local --simulation-log simulation.log
+
+# native viewer plus microphone speech input
+python eg/play.py --speech --chat-provider local --simulation-log simulation.log
 
 # native viewer plus Gemini chat
 python eg/play.py --chat --chat-provider gemini --chat-model "Gemini 3 Flash Preview"
@@ -40,6 +49,18 @@ Capture:
 - map switching
 - three onboard cameras
 - robot driving in the example scene
+
+With `--speech`, speak near the default microphone. Speech is transcribed by the optional `SpeechRecognition` Google Web Speech recognizer and passed into the same Task 3 parser and executor as typed commands. The expected terminal sequence is:
+
+```text
+[STT] microphone ready; speak an English command
+[STT] heard=walk forward for three seconds
+[CMD] accepted actions=move
+[EXEC] 1/1 type=move
+[DONE] 1/1 type=move
+```
+
+The `--speech` mode needs microphone permission and an internet connection for transcription. Type `quit` or say `quit` to close the simulation.
 
 ## 3. Task 3: typed English command parser
 
