@@ -1,0 +1,8 @@
+{
+  "objects": [
+    {"name": "chair_green_1", "class": "chair", "color": "green", "x": 2.2, "y": 0.6, "z": 0.0},
+    {"name": "chair_red_2", "class": "chair", "color": "red", "x": -1.8, "y": 1.6, "z": 0.0},
+    {"name": "ball_blue_1", "class": "sports ball", "color": "blue", "x": 0.9, "y": -1.2, "z": 0.0},
+    {"name": "stop_red_1", "class": "stop sign", "color": "red", "x": -2.5, "y": -1.1, "z": 0.0}
+  ]
+}
