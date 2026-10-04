@@ -81,6 +81,20 @@ def test_chat_worker_keeps_multi_turn_history():
         worker.close()
 
 
+def test_local_chat_repeats_previous_command_and_slows_movement():
+    worker = CommandChatWorker(StructuredCommandParser())
+    try:
+        first = worker.submit("walk forward for 2 seconds")
+        repeated = worker.submit("do it again")
+        slower = worker.submit("do that again, but slower")
+        assert first["actions"][0]["duration"] == 2.0
+        assert repeated["actions"][0]["duration"] == 2.0
+        assert slower["actions"][0]["vx"] == 0.5
+        assert slower["actions"][0]["duration"] == 4.0
+    finally:
+        worker.close()
+
+
 def test_execution_worker_runs_actions_in_order_and_logs_lifecycle():
     logs = []
     worker = CommandExecutionWorker(MotionSkillController(), logs.append)

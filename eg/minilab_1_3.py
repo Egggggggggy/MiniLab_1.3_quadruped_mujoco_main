@@ -113,7 +113,7 @@ def _extract_object_class(text: str) -> Optional[str]:
     return None
 
 
-def _parse_command_local(text: str) -> Dict[str, Any]:
+def _parse_command_local(text: str, history: Optional[Sequence[Dict[str, str]]] = None) -> Dict[str, Any]:
     """Convert a text command into a structured lab-style command list.
 
     The parser supports motion commands, turn commands, and object-search commands.
@@ -128,6 +128,34 @@ def _parse_command_local(text: str) -> Dict[str, Any]:
     lower = raw.lower()
     if any(token in lower for token in ["fly to", "roof", "into the sky", "underwater", "teleport"]):
         return {"accepted": False, "reason": "unsafe or out-of-scope request", "actions": []}
+
+    if any(token in lower for token in ["do it again", "do that again", "repeat that", "repeat it"]):
+        previous_actions = []
+        for message in reversed(history or []):
+            if message.get("role") != "assistant":
+                continue
+            try:
+                previous = json.loads(message.get("content", "{}"))
+            except json.JSONDecodeError:
+                continue
+            if previous.get("accepted") and previous.get("actions"):
+                previous_actions = [dict(action) for action in previous["actions"]]
+                break
+        if not previous_actions:
+            return {"accepted": False, "reason": "no previous command to repeat", "actions": []}
+        if "slower" in lower:
+            for action in previous_actions:
+                if action.get("type") == "move":
+                    original_speed = float(action.get("vx", 1.0))
+                    original_duration = float(action.get("duration", 3.0))
+                    action["vx"] = original_speed * 0.5
+                    action["duration"] = original_duration * 2.0
+        summary = "; ".join(
+            action["type"] if action["type"] != "goto_object" else
+            f"goto_object({action.get('class', 'unknown')}, {action.get('color', 'unknown')})"
+            for action in previous_actions
+        )
+        return {"accepted": True, "actions": previous_actions, "raw": raw, "summary": summary}
 
     actions: List[Dict[str, Any]] = []
     clauses = [clause.strip() for clause in re.split(r"\s*(?:,|\bthen\b|\band then\b)\s*", lower) if clause.strip()]
@@ -261,7 +289,7 @@ class StructuredCommandParser:
     def parse(self, text: str, history: Optional[Sequence[Dict[str, str]]] = None) -> Dict[str, Any]:
         raw = (text or "").strip()
         if self.provider == "local":
-            return _parse_command_local(raw)
+            return _parse_command_local(raw, history)
         missing = []
         if not self.api_key:
             missing.append("API key")
@@ -270,7 +298,7 @@ class StructuredCommandParser:
         if self.provider == "openai-compatible" and not self.endpoint:
             missing.append("API endpoint")
         if missing:
-            fallback = _parse_command_local(raw)
+            fallback = _parse_command_local(raw, history)
             fallback["provider"] = self.provider
             fallback["llm_used"] = False
             fallback["fallback_reason"] = "missing " + " and ".join(missing)
@@ -283,7 +311,7 @@ class StructuredCommandParser:
             return parsed
         except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError,
             http.client.HTTPException) as exc:
-            fallback = _parse_command_local(raw)
+            fallback = _parse_command_local(raw, history)
             fallback["provider"] = self.provider
             fallback["llm_used"] = False
             fallback["fallback_reason"] = str(exc)
