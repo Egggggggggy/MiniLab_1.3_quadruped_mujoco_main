@@ -10,12 +10,28 @@ Joint order:
    sudo chmod 666 /dev/input/event*
 """
 import time
+import threading
 from pathlib import Path
 import sys
 import mujoco
 import numpy as np
 import onnxruntime as ort
 import yaml
+
+try:
+    from minilab_1_3 import (
+        MotionSkillController,
+        StructuredCommandParser,
+        TerminalChatSession,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "minilab_1_3":
+        raise
+    from eg.minilab_1_3 import (
+        MotionSkillController,
+        StructuredCommandParser,
+        TerminalChatSession,
+    )
 
 
 # All in-repo resources are located relative to this file, so running does not
@@ -316,6 +332,59 @@ def reset_robot(model, data, default_angles_mujoco, position=None, quaternion=No
     mujoco.mj_forward(model, data)
 
 
+class SimulationMotionSkills(MotionSkillController):
+    """Bridge chat motion skills into play.py's policy command vector."""
+
+    def __init__(self, model, data):
+        super().__init__(model, data)
+        self._command = np.zeros(3, dtype=np.float32)
+        self._command_lock = threading.Lock()
+
+    def move(self, vx, vy, wz, duration):
+        command = super().move(vx, vy, wz, duration)
+        with self._command_lock:
+            self._command[:] = [vx, vy, wz]
+        return command
+
+    def turn(self, angle_deg, target_yaw=None):
+        command = super().turn(angle_deg, target_yaw)
+        with self._command_lock:
+            self._command[:] = [0.0, 0.0, 0.8 if angle_deg >= 0 else -0.8]
+        return command
+
+    def update(self):
+        # The learned policy, not this worker thread, owns joint velocities.
+        # This method only advances action completion from simulation state.
+        with self.lock:
+            if not self.pending:
+                return
+            item = self.pending[0]
+            now = time.time()
+            if item["type"] == "move" and now - item["start"] >= item["duration"]:
+                self.pending.pop(0)
+                self._complete_pose(item)
+            elif item["type"] == "turn":
+                remaining = (item["target_yaw"] - self._yaw() + np.pi) % (2 * np.pi) - np.pi
+                if abs(remaining) < 0.08:
+                    self.pending.pop(0)
+                    self._complete_pose(item)
+
+    def command(self):
+        with self.lock:
+            if not self.pending:
+                return np.zeros(3, dtype=np.float32)
+            item = self.pending[0]
+            if item["type"] == "move":
+                # Match get_commands(): vx/vy/wz are body-frame policy inputs,
+                # equivalent to W/S, A/D, and Q/E respectively.
+                return np.array([item["vx"], item["vy"], item["wz"]], dtype=np.float32)
+            if item["type"] == "turn":
+                remaining = (item["target_yaw"] - self._yaw() + np.pi) % (2 * np.pi) - np.pi
+                direction = 1.0 if remaining >= 0.0 else -1.0
+                return np.array([0.0, 0.0, 0.8 * direction], dtype=np.float32)
+            return np.zeros(3, dtype=np.float32)
+
+
 def build_runtime_config(args, kps, kds):
     """Adapt Dog's flat policy config into the structure used by runtime_control."""
     map_spawns = {
@@ -415,6 +484,24 @@ if __name__ == "__main__":
         help="enable only the browser live-tuning panel (no native MuJoCo viewer)",
     )
     parser.add_argument("--gui-port", type=int, default=8765, help="browser panel port")
+    parser.add_argument(
+        "--chat",
+        action="store_true",
+        help="start the threaded terminal command chat alongside MuJoCo",
+    )
+    parser.add_argument(
+        "--chat-provider",
+        default="local",
+        choices=["local", "openai", "openai-compatible", "anthropic", "gemini"],
+        help="LLM provider used by --chat",
+    )
+    parser.add_argument("--chat-model", help="model name used by --chat")
+    parser.add_argument(
+        "--simulation-log",
+        type=Path,
+        default=Path("simulation.log"),
+        help="file for periodic simulation logs when --chat is enabled",
+    )
     args = parser.parse_args()
     if args.gui and args.headless:
         parser.error("--gui and --headless cannot be used together")
@@ -548,6 +635,22 @@ if __name__ == "__main__":
         args.gui or args.headless,
         key_callback=key_callback,
     )
+    chat_skills = SimulationMotionSkills(mj_model, mj_data)
+    chat_session = None
+    simulation_log = None
+    if args.chat:
+        simulation_log = args.simulation_log.expanduser().resolve().open("w", encoding="utf-8")
+
+    def log_simulation(message):
+        if simulation_log is None:
+            print(message)
+        else:
+            print(message, file=simulation_log, flush=True)
+
+    if args.chat:
+        chat_parser = StructuredCommandParser(args.chat_provider, model=args.chat_model)
+        chat_session = TerminalChatSession(chat_parser, chat_skills)
+        chat_session.start()
     with display as viewer:
         # The browser and the native viewer are mutually exclusive display
         # modes, to avoid rendering twice and slowing the simulation down.
@@ -563,12 +666,17 @@ if __name__ == "__main__":
 
         start = time.time()
 
-        while viewer.is_running() and time.time() - start < simulation_duration:
+        while viewer.is_running() and time.time() - start < simulation_duration \
+            and not (chat_session is not None and chat_session.stopped()):
             step_start = time.time()
 
-            # The browser and the physical keyboard both update the motion
-            # command. Without --gui the original keyboard logic is kept.
-            if runtime.update_command(_pressed_keys):
+            # Chat commands take priority while active; otherwise retain the
+            # browser and physical keyboard controls from the original demo.
+            chat_cmd = chat_skills.command() if args.chat else np.zeros(3, dtype=np.float32)
+            if args.chat and np.any(np.abs(chat_cmd) > 1e-6):
+                cmd = chat_cmd
+                height_cmd = runtime_config["command"]["height"]
+            elif runtime.update_command(_pressed_keys):
                 cmd = np.array([
                     runtime_config["command"]["linear_x"],
                     runtime_config["command"]["linear_y"],
@@ -690,10 +798,12 @@ if __name__ == "__main__":
             if count % (control_decimation * 50) == 0:
                 grav = quat_rotate_inverse(quat_xyzw, np.array([0., 0., -1.]))
                 h = mj_data.qpos[2]
-                print(f"[{time.time()-start:.1f}s] Step {count} H={h:.3f}(cmd={height_cmd:.2f}) "
-                      f"vx={mj_data.qvel[0]:.2f} vy={mj_data.qvel[1]:.2f} wz={mj_data.qvel[5]:.2f} "
-                      f"grav_z={grav[2]:.3f} "
-                      f"act=[{action_isaac.min():.2f},{action_isaac.max():.2f}]")
+                log_simulation(
+                    f"[{time.time()-start:.1f}s] Step {count} H={h:.3f}(cmd={height_cmd:.2f}) "
+                    f"vx={mj_data.qvel[0]:.2f} vy={mj_data.qvel[1]:.2f} wz={mj_data.qvel[5]:.2f} "
+                    f"grav_z={grav[2]:.3f} "
+                    f"act=[{action_isaac.min():.2f},{action_isaac.max():.2f}]"
+                )
 
             if not args.gui and not args.headless:
                 viewer.sync()
@@ -701,5 +811,9 @@ if __name__ == "__main__":
             if simulation_dt - elapsed > 0:
                 time.sleep(simulation_dt - elapsed)
 
+    if chat_session is not None:
+        chat_session.close()
+    if simulation_log is not None:
+        simulation_log.close()
     scene.close()
     print("\n[INFO] simulation finished")

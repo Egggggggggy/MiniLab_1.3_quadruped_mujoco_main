@@ -8,14 +8,31 @@ python -m pip install -e .[test]
 python -m pytest -q
 ```
 
-## 2. Task 2: platform and motion skills
+## 2. Task 2: platurn right 45 degrees
+turn left 45 degrees
+tform and motion skills
 
 ```bash
 # native MuJoCo viewer
 python eg/play.py
 
+# native viewer plus threaded terminal chat
+python eg/play.py --chat --chat-provider local --simulation-log simulation.log
+
+# native viewer plus Gemini chat
+python eg/play.py --chat --chat-provider gemini --chat-model "Gemini 3 Flash Preview"
+
+# native viewer plus OpenAI chat
+python eg/play.py --chat --chat-provider openai --chat-model gpt-6-luna
+
 # browser-panel GUI mode
 python eg/play.py --gui
+```
+
+When `--chat` is enabled, periodic simulation telemetry is written to `simulation.log` instead of repeatedly printing over the command prompt. To monitor it separately, open a second PowerShell terminal in the project directory and run:
+
+```powershell
+Get-Content .\simulation.log -Wait
 ```
 
 Capture:

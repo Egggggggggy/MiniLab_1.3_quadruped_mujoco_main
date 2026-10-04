@@ -129,40 +129,40 @@ def _parse_command_local(text: str) -> Dict[str, Any]:
         return {"accepted": False, "reason": "unsafe or out-of-scope request", "actions": []}
 
     actions: List[Dict[str, Any]] = []
+    clauses = [clause.strip() for clause in re.split(r"\s*(?:,|\bthen\b|\band then\b)\s*", lower) if clause.strip()]
+    for clause in clauses:
+        if any(token in clause for token in ["walk", "move forward", "go forward", "go straight", "move straight"]):
+            seconds = 3.0
+            if any(ch.isdigit() for ch in clause):
+                seconds = float(_extract_number(clause) or seconds)
+            actions.append({
+                "type": "move",
+                "vx": 0.8,
+                "vy": 0.0,
+                "wz": 0.0,
+                "duration": max(0.5, seconds),
+            })
+            continue
 
-    if any(token in lower for token in ["walk", "move forward", "go forward", "go straight", "move straight"]):
-        seconds = 3.0
-        if "for" in lower and any(ch.isdigit() for ch in lower):
-            seconds = float(_extract_number(lower) or seconds)
-        actions.append({
-            "type": "move",
-            "vx": 0.8,
-            "vy": 0.0,
-            "wz": 0.0,
-            "duration": max(0.5, seconds),
-        })
+        if "turn" in clause:
+            direction = "left" if "left" in clause else "right" if "right" in clause else "back" if any(
+                token in clause for token in ["back", "around"]
+            ) else "left"
+            angle = 180.0 if direction == "back" else 90.0
+            if any(ch.isdigit() for ch in clause):
+                angle = float(_extract_number(clause) or angle)
+            actions.append({"type": "turn", "angle_deg": angle, "direction": direction})
+            continue
 
-    if any(token in lower for token in ["turn back", "turn around", "turn 180", "turn around and"]):
-        actions.append({"type": "turn", "angle_deg": 180.0, "direction": "back"})
-    elif "turn left" in lower or "turn towards left" in lower:
-        actions.append({"type": "turn", "angle_deg": 90.0, "direction": "left"})
-    elif "turn right" in lower or "turn towards right" in lower:
-        actions.append({"type": "turn", "angle_deg": 90.0, "direction": "right"})
-    elif "turn" in lower:
-        angle = 90.0
-        if any(ch.isdigit() for ch in lower):
-            angle = float(_extract_number(lower) or angle)
-        actions.append({"type": "turn", "angle_deg": angle, "direction": "straight"})
-
-    if any(token in lower for token in ["go to", "goto", "search for", "find the", "go to the"]):
-        obj_class = _extract_object_class(lower) or "chair"
-        color = _extract_color(lower) or "green"
-        actions.append({
-            "type": "goto_object",
-            "class": obj_class,
-            "color": color,
-            "text": raw,
-        })
+        if any(token in clause for token in ["go to", "goto", "search for", "find the", "go to the"]):
+            obj_class = _extract_object_class(clause) or "chair"
+            color = _extract_color(clause) or "green"
+            actions.append({
+                "type": "goto_object",
+                "class": obj_class,
+                "color": color,
+                "text": raw,
+            })
 
     if not actions:
         return {"accepted": False, "reason": "unsupported or ambiguous request", "actions": []}
@@ -431,6 +431,14 @@ class CommandExecutionWorker:
         else:
             raise ValueError("unsupported action type: %s" % action_type)
         self.skills.wait_until_idle()
+        if self.skills.adjust_pose():
+            self.output("[ADJUST] type=%s" % action_type)
+            self.skills.wait_until_idle()
+        pose_result = self.skills.last_pose_result
+        if pose_result and pose_result.get("tracked"):
+            self.output("[POSE] type=%s position_error=%.3f yaw_error=%.2fdeg" % (
+                action_type, pose_result["position_error"], math.degrees(pose_result["yaw_error"])
+            ))
         self.output("[DONE] %d/%d type=%s" % (index, total, action_type))
 
 
@@ -577,9 +585,30 @@ class MotionSkillController:
         self.data = data
         self.pending: List[Dict[str, Any]] = []
         self.lock = threading.Lock()
+        self.last_pose_result: Optional[Dict[str, Any]] = None
 
     def move(self, vx: float, vy: float, wz: float, duration: float) -> Dict[str, Any]:
-        cmd = {"type": "move", "vx": float(vx), "vy": float(vy), "wz": float(wz), "duration": float(duration), "start": time.time()}
+        start_yaw = self._yaw()
+        forward = float(vx)
+        lateral = float(vy)
+        cmd = {
+            "type": "move",
+            "vx": forward,
+            "vy": lateral,
+            "world_vx": forward * math.cos(start_yaw) - lateral * math.sin(start_yaw),
+            "world_vy": forward * math.sin(start_yaw) + lateral * math.cos(start_yaw),
+            "wz": float(wz),
+            "duration": float(duration),
+            "start": time.time(),
+            "start_yaw": start_yaw,
+            "initial_pose": self._pose(),
+        }
+        if cmd["initial_pose"] is not None:
+            cmd["target_pose"] = {
+                "x": cmd["initial_pose"]["x"] + cmd["world_vx"] * float(duration),
+                "y": cmd["initial_pose"]["y"] + cmd["world_vy"] * float(duration),
+                "yaw": cmd["initial_pose"]["yaw"],
+            }
         with self.lock:
             self.pending.append(cmd)
         return cmd
@@ -589,7 +618,7 @@ class MotionSkillController:
         if target_yaw is None:
             target_yaw = current_yaw + math.radians(float(angle_deg))
         cmd = {"type": "turn", "target_yaw": float(target_yaw), "start_yaw": float(current_yaw),
-               "angle_deg": float(angle_deg), "start": time.time()}
+               "angle_deg": float(angle_deg), "start": time.time(), "initial_pose": self._pose()}
         with self.lock:
             self.pending.append(cmd)
         return cmd
@@ -614,6 +643,29 @@ class MotionSkillController:
             self.update()
             time.sleep(poll_interval)
 
+    def adjust_pose(self, position_tolerance: float = 0.08,
+                    yaw_tolerance: float = math.radians(5.0)) -> bool:
+        result = self.last_pose_result
+        if not result or not result.get("tracked") or result.get("corrected"):
+            return False
+        result["corrected"] = True
+        if result["type"] == "move" and result["position_error"] > position_tolerance:
+            final = result["final"]
+            target = result["target"]
+            world_x = max(-0.3, min(0.3, target["x"] - final["x"]))
+            world_y = max(-0.3, min(0.3, target["y"] - final["y"]))
+            yaw = final["yaw"]
+            local_x = world_x * math.cos(yaw) + world_y * math.sin(yaw)
+            local_y = -world_x * math.sin(yaw) + world_y * math.cos(yaw)
+            duration = max(0.2, min(1.0, math.hypot(world_x, world_y) / 0.3))
+            self.move(local_x, local_y, 0.0, duration)
+            return True
+        if result["type"] == "turn" and result["yaw_error"] > yaw_tolerance:
+            correction = math.degrees(_angle_difference(result["target"]["yaw"], result["final"]["yaw"]))
+            self.turn(correction, target_yaw=result["target"]["yaw"])
+            return True
+        return False
+
     def update(self) -> None:
         with self.lock:
             if not self.pending:
@@ -626,24 +678,52 @@ class MotionSkillController:
                     self.pending.pop(0)
                     if self.data is not None:
                         self.data.qvel[:] = 0.0
+                    self._complete_pose(item)
                 elif self.data is None:
                     return
                 else:
-                    self.data.qvel[0] = item["vx"]
-                    self.data.qvel[1] = item["vy"]
+                    self.data.qvel[0] = item["world_vx"]
+                    self.data.qvel[1] = item["world_vy"]
                     self.data.qvel[5] = item["wz"]
             elif item["type"] == "turn":
                 if self.data is None:
                     if now - item["start"] >= max(0.5, abs(item["angle_deg"]) / 90.0):
                         self.pending.pop(0)
+                        self._complete_pose(item)
                     return
                 current = self._yaw()
                 remaining = _angle_difference(item["target_yaw"], current)
                 if abs(remaining) < 0.08:
                     self.pending.pop(0)
+                    self._complete_pose(item)
                 else:
                     direction = 1.0 if remaining > 0 else -1.0
                     self.data.qvel[5] = 0.5 * direction
+
+    def _pose(self) -> Optional[Dict[str, float]]:
+        if self.data is None:
+            return None
+        return {"x": float(self.data.qpos[0]), "y": float(self.data.qpos[1]), "yaw": self._yaw()}
+
+    def _complete_pose(self, item: Dict[str, Any]) -> None:
+        initial = item.get("initial_pose")
+        final = self._pose()
+        if initial is None or final is None:
+            self.last_pose_result = {"tracked": False, "type": item["type"]}
+            return
+        if item["type"] == "move":
+            target = item["target_pose"]
+        else:
+            target = {"x": initial["x"], "y": initial["y"], "yaw": item["target_yaw"]}
+        self.last_pose_result = {
+            "tracked": True,
+            "type": item["type"],
+            "initial": initial,
+            "target": target,
+            "final": final,
+            "position_error": math.hypot(target["x"] - final["x"], target["y"] - final["y"]),
+            "yaw_error": abs(_angle_difference(target["yaw"], final["yaw"])),
+        }
 
     def _yaw(self) -> float:
         if self.data is None:
@@ -772,6 +852,9 @@ class TerminalChatSession:
     def join(self) -> None:
         self._thread.join()
 
+    def stopped(self) -> bool:
+        return self._stop.is_set()
+
     def close(self) -> None:
         self._stop.set()
         self.parser_worker.close()
@@ -790,6 +873,13 @@ class TerminalChatSession:
                     self.output("[CMD] rejected reason=empty or non-English command")
                     continue
                 result = self.parser_worker.submit(text)
+                if result.get("llm_used"):
+                    self.output("[LLM] provider=%s" % result.get("provider", self.parser_worker.parser.provider))
+                else:
+                    self.output("[FALLBACK] provider=%s reason=%s" % (
+                        result.get("provider", self.parser_worker.parser.provider),
+                        result.get("fallback_reason", "local parser"),
+                    ))
                 if not result["accepted"]:
                     self.output("[CMD] rejected reason=%s" % result["reason"])
                     continue

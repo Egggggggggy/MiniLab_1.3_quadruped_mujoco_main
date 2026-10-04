@@ -1,4 +1,7 @@
 import json
+import math
+
+import pytest
 
 from eg.minilab_1_3 import (
     COMMAND_SCHEMA,
@@ -17,6 +20,21 @@ def test_parse_command_accepts_motion_request():
     assert result["accepted"] is True
     assert [item["type"] for item in result["actions"]][:2] == ["move", "turn"]
     assert result["actions"][0]["duration"] > 0
+
+
+def test_parse_command_preserves_turn_direction_angle_and_order():
+    right_first = parse_command("turn 45 degrees right")
+    left_first = parse_command("turn 45 degrees left")
+    right_last = parse_command("turn right 45 degrees")
+    left_last = parse_command("turn left 45 degrees")
+    ordered = parse_command("turn 45 degrees then walk 3 seconds")
+
+    assert right_first["actions"][0]["angle_deg"] == 45.0
+    assert right_first["actions"][0]["direction"] == "right"
+    assert left_first["actions"][0]["direction"] == "left"
+    assert right_last["actions"][0]["direction"] == "right"
+    assert left_last["actions"][0]["direction"] == "left"
+    assert [item["type"] for item in ordered["actions"]] == ["turn", "move"]
 
 
 def test_parse_command_rejects_non_english_or_empty():
@@ -72,3 +90,15 @@ def test_execution_worker_runs_actions_in_order_and_logs_lifecycle():
         ]
     finally:
         worker.close()
+
+
+def test_move_uses_heading_at_command_start():
+    class FakeData:
+        qpos = [0.0, 0.0, 0.0, math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)]
+        qvel = [0.0] * 6
+
+    controller = MotionSkillController(data=FakeData())
+    command = controller.move(1.0, 0.0, 0.0, 0.01)
+    assert command["start_yaw"] == pytest.approx(math.pi / 2)
+    assert command["world_vx"] == pytest.approx(0.0, abs=1e-6)
+    assert command["world_vy"] == pytest.approx(1.0, abs=1e-6)
